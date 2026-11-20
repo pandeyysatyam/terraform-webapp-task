@@ -423,6 +423,147 @@ Sabse mehnga NAT Gateway (per hour + data), ALB, RDS Multi-AZ (double), 2x EC2. 
 
 ---
 
+### Project specific "Why" questions (interviewer yahi sabse zyada poochta hai)
+
+**Q: EC2 private subnet me kyu, public me kyu nahi?**
+Public me rakhte to har instance ka public IP hota, attack surface badhta. Ab sirf ALB public hai, instances tak sirf ALB pahunch sakta hai.
+
+**Q: ECS/EKS/Lambda kyu nahi use kiya, EC2 kyu?**
+Chhota single app hai, EC2 + ASG se core concepts (VPC, ALB, scaling, IAM) clearly dikhte hai. Containers aaye ya services badhe to ECS Fargate next step hota (server manage nahi karna padta).
+
+**Q: Region ap-south-1 kyu?**
+India ke users ke liye latency kam, aur data India me rehta hai.
+
+**Q: Port 3000 kyu, 80 pe app kyu nahi chalayi?**
+Linux me 1024 se neeche port bind karne ke liye root chahiye. App ko non-privileged port pe chalana safe hai, 80/443 ALB sambhalta hai.
+
+**Q: min 2 instances kyu, 1 kyu nahi?**
+1 instance = single point of failure. 2 instances, 2 AZ me = ek AZ ya instance gire to bhi app chalti rahe.
+
+**Q: RDS hi kyu, EC2 pe khud MySQL kyu nahi daala?**
+RDS me backup, patching, Multi-AZ failover, encryption sab managed hai. EC2 pe ye sab khud karna padta.
+
+**Q: Secrets Manager vs SSM Parameter Store?**
+Dono me secret rakh sakte hai. Secrets Manager me automatic rotation (RDS ke saath built in) hai, but paid ($0.40/secret/month). Parameter Store SecureString free (standard tier) but rotation khud banana padta.
+
+**Q: Terraform hi kyu, CloudFormation kyu nahi?**
+Terraform multi-cloud hai, `plan` output clear hai, community modules bahut hai. CloudFormation sirf AWS ke liye.
+
+### Networking ka hisaab (CIDR questions)
+
+**Q: 10.0.0.0/16 me kitne IP? /24 me kitne?**
+/16 = 2^(32-16) = 65,536. /24 = 256. AWS har subnet me **5 IP reserve** karta hai (pehle 4 + last 1), to /24 me usable **251**.
+
+**Q: `cidrsubnet("10.0.0.0/16", 8, 10)` ka answer?**
+`10.0.10.0/24`. /16 + 8 bits = /24, aur 10th block.
+
+**Q: VPC ke andar EC2 RDS se kaise baat karta hai bina route ke?**
+Har route table me ek **local route** (10.0.0.0/16 -> local) apne aap hota hai, VPC ke andar sab subnets aapas me baat kar sakte hai. Rokne ka kaam Security Group karta hai.
+
+**Q: NAT Gateway aur Internet Gateway me farak?**
+IGW dono taraf (in + out) traffic allow karta hai, public IP chahiye. NAT sirf andar se bahar (outbound) jaane deta hai, bahar se naya connection andar nahi aa sakta.
+
+**Q: NAT Gateway public subnet me hi kyu?**
+NAT ko khud internet tak jaana hai, jo sirf IGW route wale (public) subnet se possible hai.
+
+### Troubleshooting scenarios (advanced interviewers ka favourite)
+
+**Q: Site pe 502 Bad Gateway aa raha hai, kya check karoge?**
+502 = ALB ko target se galat/koi response nahi mila. Check: app crash to nahi (`systemctl status app`, `journalctl -u app`), app 3000 pe listen kar rahi hai ya nahi, app-sg me ALB se 3000 allowed hai ya nahi.
+
+**Q: 503 Service Unavailable?**
+Target group me **koi healthy target nahi**. Target group ka Targets tab dekho, health check reason padho. Mostly `/health` fail ya instances abhi boot ho rahe hai.
+
+**Q: 504 Gateway Timeout?**
+App ne time pe jawab nahi diya (ALB idle timeout default 60 sec). DB query slow ya DB connect hi nahi ho raha (db-sg check karo).
+
+**Q: Instances baar baar terminate hoke naye ban rahe hai (loop), kyu?**
+ELB health check fail ho raha hai grace period (180 sec) ke baad. Reason: user_data fail (git clone, npm install), app crash, ya health check path/port galat. Debug: SSM se login karke `/var/log/cloud-init-output.log` padho.
+
+**Q: Page pe "Database: error: ETIMEDOUT" aa raha hai?**
+App DB tak pahunch nahi pa rahi. db-sg me app-sg allowed hai? RDS available hai? DB_HOST sahi hai?
+
+**Q: App start hi nahi ho rahi, "AccessDeniedException" Secrets Manager se?**
+IAM role me us secret ka `GetSecretValue` permission nahi, ya instance profile attach nahi hua. Agar NAT nahi chal raha to error timeout hoga, AccessDenied nahi.
+
+**Q: `terraform apply` ACM certificate pe atak gaya (bahut der se waiting)?**
+DNS validation record sahi hosted zone me nahi bana, ya domain ke nameservers Route 53 ke nahi hai (domain registrar pe NS update nahi kiya).
+
+**Q: `terraform destroy` ke baad dobara `apply` kiya to "secret already scheduled for deletion" error?**
+Secrets Manager 30 din recovery window rakhta hai. Fix: `aws secretsmanager delete-secret --secret-id <naam> --force-delete-without-recovery` ya code me `recovery_window_in_days = 0`.
+
+**Q: Kisi aur ka `apply` chal raha tha, mera "Error acquiring the state lock" aaya?**
+DynamoDB lock laga hai. Wait karo. Agar pakka koi process nahi chal raha (crash hua tha) to `terraform force-unlock <LOCK_ID>`.
+
+### Terraform deep questions
+
+**Q: `terraform plan` me `~`, `+`, `-`, `-/+` ka matlab?**
+`+` naya banega, `-` delete hoga, `~` in-place update, `-/+` delete karke dobara banega (replace, downtime ho sakta hai, dhyan se dekho).
+
+**Q: Ek resource zabardasti recreate karna hai?**
+`terraform apply -replace="aws_instance.x"` (purana `taint` command deprecated hai).
+
+**Q: Resource ka naam code me badla, Terraform delete + create dikha raha hai, kaise bachoge?**
+`moved {}` block ya `terraform state mv old new`. Isse sirf state me naam badlega, real resource nahi chhedega.
+
+**Q: `lifecycle` ke options?**
+`create_before_destroy` (is project me ACM cert pe), `prevent_destroy` (galti se delete na ho, prod DB pe lagate), `ignore_changes` (bahar se badalne wale fields ignore, jaise ASG ka desired_capacity jo autoscaling badalta hai).
+
+**Q: `sensitive = true` se secret safe ho jaata hai kya?**
+Nahi. Sirf CLI output me chhupta hai. State file me plain text hi rehta hai. Asli safety: state encrypted S3 + IAM restrict.
+
+**Q: `terraform fmt` vs `validate` vs `plan`?**
+`fmt` = formatting. `validate` = syntax aur references (AWS se baat nahi karta). `plan` = AWS se real state compare karke changes batata hai.
+
+**Q: Provisioners (`remote-exec`) kyu use nahi kiye?**
+HashiCorp khud last resort bolta hai. Unki jagah user_data, cloud-init, ya Packer AMI better hai. Is project me user_data use kiya.
+
+**Q: Module kya hai? Is project ko module me kaise todoge?**
+Reusable Terraform folder with inputs (variables) aur outputs. Yaha `modules/network`, `modules/alb`, `modules/compute`, `modules/rds` bana ke root se call kar sakte hai, phir dev/prod alag values se.
+
+**Q: `data` source me `aws_ssm_parameter` se AMI kyu, `aws_ami` filter kyu nahi?**
+Dono chalte hai. SSM parameter AWS officially maintain karta hai, simple aur reliable. `aws_ami` me name filter + `most_recent` likhna padta hai.
+
+### CI/CD questions
+
+**Q: PR pe plan aur main pe apply, ye flow kyu?**
+PR pe reviewer plan dekh ke approve kare (kya badlega), merge ke baad hi production change ho. Galti se direct apply nahi.
+
+**Q: OIDC role ki trust policy me kya likhoge?**
+Federated principal `token.actions.githubusercontent.com`, action `sts:AssumeRoleWithWebIdentity`, condition `aud = sts.amazonaws.com` aur `sub = repo:pandeyysatyam/terraform-webapp-task:ref:refs/heads/main`. `sub` condition na ho to koi bhi GitHub repo role le sakta hai, bada risk.
+
+**Q: Pipeline me security scan add karna ho to?**
+`tflint` (best practices), `checkov` ya `tfsec`/`trivy` (security misconfig, jaise open SG, unencrypted bucket). Plan se pehle step daalo.
+
+**Q: App code badla to deploy kaise hoga?**
+Abhi app sirf boot pe `git clone` hoti hai. Naya code lane ke liye ASG instance refresh karna padega (naye instances naya code clone karenge). Better: CodeDeploy, ya Docker image ECR me push karke rolling update.
+
+### Node app questions
+
+**Q: Credentials code me nahi diye, phir AWS SDK ko kaise mila?**
+SDK ki **default credential chain**: env vars, phir config files, phir EC2 instance metadata (IMDS) se role ke temporary credentials. EC2 pe aakhri wala kaam karta hai.
+
+**Q: Connection pool kyu?**
+Har request pe naya MySQL connection (TCP + auth) banana slow hai. Pool me 5 connections ready rehte hai, reuse hote hai, DB pe load bhi limited.
+
+**Q: Password rotate hua to app ka kya hoga?**
+App sirf startup pe password padhti hai, rotation ke baad naye connections fail honge jab tak restart na ho. Fix: auth error pe secret dobara fetch karo, ya RDS Proxy use karo.
+
+### HR/experience style questions (project ke baare me)
+
+**Q: Is project me sabse bada challenge kya tha?**
+Sach me jo hua wahi bolo. Common examples: ACM DNS validation ka wait aur dependency (validation resource ka ARN listener me use karke solve), private instances ka internet access (NAT), ya Secrets Manager destroy/recreate wala naam conflict.
+
+**Q: Isko production ready banane ke liye aur kya karoge?**
+Section 5 ki review table: har AZ me NAT, WAF, CloudWatch alarms, instance refresh, deletion protection + final snapshot, environment approval, modules + multi env, Packer/Docker se image.
+
+**Q: Monthly cost kitna aayega (rough)?**
+NAT ~$32 + data, ALB ~$16-20, 2x t3.micro ~$15, RDS db.t3.micro Multi-AZ ~$25-30, Secrets Manager $0.40. Total roughly **$90-100/month** (Mumbai region, approx). Isliye practice ke baad destroy.
+
+> Tip: Jo cheez aapne khud nahi chalayi (jaise real domain pe deploy), interview me bolo "design aur code maine kiya, deploy ka flow ye hai". Jhooth pakda jaata hai, honest answer + strong concept zyada impress karta hai.
+
+---
+
 ## 7. Interview me 30 second ka pitch
 
 "Maine Terraform se AWS pe ek 3 tier web app deploy kiya. 2 AZ me VPC with public, private-app aur private-db subnets. Internet traffic sirf ALB pe aata hai jo ACM certificate se HTTPS terminate karta hai aur HTTP ko redirect karta hai. App Auto Scaling Group me private subnet me chalti hai, CPU target tracking ke saath. DB RDS MySQL Multi-AZ, encrypted, private. Password Terraform generate karke Secrets Manager me rakhta hai aur EC2 IAM role se padhta hai, IMDSv2 enforce hai, SSH ki jagah SSM. State S3 me DynamoDB locking ke saath, aur GitHub Actions OIDC se PR pe plan aur main pe apply karta hai, koi static AWS key nahi."
